@@ -7,8 +7,10 @@
 #include "commondefine.h"
 #include "utils.h"
 
+#include <QDBusPendingReply>
 #include <QJsonParseError>
 #include <QJsonObject>
+#include <QScreen>
 #include <DDBusSender>
 #include <DGuiApplicationHelper>
 
@@ -30,24 +32,28 @@ SlideshowManager::~SlideshowManager()
 
 }
 
-bool SlideshowManager::doSetWallpaperSlideShow(const QString &monitorName,const QString &wallpaperSlideShow)
+bool SlideshowManager::doSetWallpaperSlideShow(const QString &monitorName, const QString &wallpaperSlideShow)
 {
-    int idx = m_dbusProxy->GetCurrentWorkspace();
+    if (!isValidScreen(monitorName)) {
+        qWarning() << "monitor can not found: " << monitorName;
+        return false;
+    }
+    QByteArray jsonData = m_wallpaperSlideShow.toUtf8();
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonData, &err);
 
-    QJsonDocument doc = QJsonDocument::fromJson(wallpaperSlideShow.toLatin1());
-    QJsonObject cfgObj = doc.object();
+    QJsonObject cfgObj;
+    if (err.error == QJsonParseError::NoError && doc.isObject()) {
+        cfgObj = doc.object();
+    }
 
-    QString key = QString("%1&&%2").arg(monitorName).arg(idx);
+    cfgObj[monitorName] = wallpaperSlideShow;
 
-    cfgObj[key] = wallpaperSlideShow;
+    doc.setObject(cfgObj);
 
-    QJsonDocument docTmp;
-    docTmp.setObject(cfgObj);
-    QString value = docTmp.toJson(QJsonDocument::Compact);
+    QString value = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 
     setWallpaperSlideShow(value);
-
-    m_curMonitorSpace = key;
     return true;
 }
 
@@ -70,15 +76,11 @@ bool SlideshowManager::setWallpaperSlideShow(const QString &value)
 
 QString SlideshowManager::doGetWallpaperSlideShow(QString monitorName)
 {
-    int index = m_dbusProxy->GetCurrentWorkspace();
-
     QJsonDocument doc = QJsonDocument::fromJson(m_wallpaperSlideShow.toLatin1());
     QVariantMap tempMap = doc.object().toVariantMap();
 
-    QString key = QString("%1&&%2").arg(monitorName).arg(index);
-
-    if (tempMap.count(key) == 1) {
-        return tempMap[key].toString();
+    if (tempMap.count(monitorName) == 1) {
+        return tempMap[monitorName].toString();
     }
 
     return "";
@@ -100,6 +102,11 @@ void SlideshowManager::updateWSPolicy(QString policy)
 
     QVariantMap config = doc.object().toVariantMap();
     for (auto iter : config.toStdMap()) {
+        const QString screenName = iter.first;
+        if (screenName.isEmpty()) {
+            qWarning() << "screenName is empty: " << iter.first;
+            continue;
+        }
         if (m_wsSchedulerMap.count(iter.first) == 0) {
             QSharedPointer<WallpaperScheduler> wallpaperScheduler(
                     new WallpaperScheduler(std::bind(&SlideshowManager::autoChangeBg, this, std::placeholders::_1, std::placeholders::_2)));
@@ -107,11 +114,11 @@ void SlideshowManager::updateWSPolicy(QString policy)
         }
 
         if (m_wsLoopMap.count(iter.first) == 0) {
-            m_wsLoopMap[iter.first] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType));
+            m_wsLoopMap[iter.first] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType[screenName]));
         }
-        m_wsLoopMap[iter.first]->updateWallpaperType(m_wallpaperType);
+        m_wsLoopMap[iter.first]->updateWallpaperType(m_wallpaperType[screenName]);
 
-        if (m_curMonitorSpace == iter.first && WallpaperLoopConfigManger::isValidWSPolicy(iter.second.toString())) {
+        if (WallpaperLoopConfigManger::isValidWSPolicy(iter.second.toString())) {
             bool bOk;
             int nSec = iter.second.toString().toInt(&bOk);
             if (bOk) {
@@ -129,10 +136,13 @@ void SlideshowManager::updateWSPolicy(QString policy)
 void SlideshowManager::loadWSConfig()
 {
     WallpaperLoopConfigManger wallConfig;
-    QString fileName = utils::GetUserConfigDir() + "/deepin/dde-daemon/appearance/wallpaper-slideshow.json";
-    WallpaperLoopConfigManger::WallpaperLoopConfigMap cfg = wallConfig.loadWSConfig(fileName);
+    WallpaperLoopConfigManger::WallpaperLoopConfigMap cfg = wallConfig.loadWSConfig(WS_CONFIG_PATH);
 
     for (auto monitorSpace : cfg.keys()) {
+        const QString screenName  = monitorSpace;
+        if (screenName.isEmpty()) {
+            continue;
+        }
         if (m_wsSchedulerMap.count(monitorSpace) == 0) {
             QSharedPointer<WallpaperScheduler> wallpaperScheduler(
                     new WallpaperScheduler(std::bind(&SlideshowManager::autoChangeBg, this, std::placeholders::_1, std::placeholders::_2)));
@@ -142,7 +152,7 @@ void SlideshowManager::loadWSConfig()
         m_wsSchedulerMap[monitorSpace]->setLastChangeTime(cfg[monitorSpace].lastChange);
 
         if (m_wsLoopMap.count(monitorSpace) == 0) {
-            m_wsLoopMap[monitorSpace] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType));
+            m_wsLoopMap[monitorSpace] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType.value(screenName)));
             m_wsLoopMap[monitorSpace]->updateWallpaperType(Backgrounds::BT_Custom);
         }
 
@@ -179,22 +189,13 @@ void SlideshowManager::autoChangeBg(QString monitorSpace, QDateTime date)
     }
 
     QString file = m_wsLoopMap[monitorSpace]->getNext();
-    if (file.isEmpty()) {
-        qDebug() << "file is empty";
+
+    if (file.isEmpty() || !QFile::exists(file)) {
+        qWarning() << "auto change bg error, file not exist: " << file;
         return;
     }
 
-    QString strIndex = QString::number(m_dbusProxy->GetCurrentWorkspace());
-
-    QStringList monitorlist = monitorSpace.split("&&");
-    if (monitorlist.size() != 2) {
-        qWarning() << "monitorSpace format error";
-        return;
-    }
-
-    if (strIndex == monitorlist.at(1)) {
-        setMonitorBackground(monitorlist.at(0), file);
-    }
+    setMonitorBackground(monitorSpace, file);
 
     saveWSConfig(monitorSpace, date);
 }
@@ -212,6 +213,12 @@ void SlideshowManager::init()
 
     QVariantMap tempMap = doc.object().toVariantMap();
     for (auto iter : tempMap.toStdMap()) {
+        const QString screenName = iter.first.split("&&").first();
+        if (screenName.isEmpty()) {
+            qWarning() << "screenName is empty: " << iter.first;
+            continue;
+        }
+
         if (m_wsSchedulerMap.count(iter.first) != 1) {
             QSharedPointer<WallpaperScheduler> wallpaperScheduler(
                     new WallpaperScheduler(std::bind(&SlideshowManager::autoChangeBg, this, std::placeholders::_1, std::placeholders::_2)));
@@ -219,7 +226,7 @@ void SlideshowManager::init()
         }
 
         if (!m_wsLoopMap.contains(iter.first)) {
-            m_wsLoopMap[iter.first] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType));
+            m_wsLoopMap[iter.first] = QSharedPointer<WallpaperLoop>(new WallpaperLoop(m_wallpaperType.value(screenName)));
         }
 
         if (WallpaperLoopConfigManger::isValidWSPolicy(iter.second.toString())) {
@@ -245,7 +252,38 @@ void SlideshowManager::init()
 
 void SlideshowManager::loadConfig()
 {
-    m_wallpaperSlideShow = m_settingDconfig->value(GSKEYWALLPAPERSLIDESHOW).toString();
+    QFile::remove(WS_CONFIG_PATH);
+
+    const QString wallpaperSlideShow = m_settingDconfig->value(GSKEYWALLPAPERSLIDESHOW).toString();
+
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(wallpaperSlideShow.toLatin1(), &err);
+    if (err.error != QJsonParseError::NoError) {
+        qWarning() << "parse wallpaperSlideShow failed:" << err.errorString();
+        return;
+    }
+
+    QJsonObject rootObject = doc.object();
+    QJsonObject newObject;
+
+    // 兼容老配置，去掉&&
+    for (auto it = rootObject.begin(); it != rootObject.end(); ++it) {
+        QString key = it.key();
+        QJsonValue value = it.value();
+
+        if (key.contains("&&")) {
+            QString newKey = key.split("&&").first();
+            newObject[newKey] = value;
+        } else {
+            newObject[key] = value;
+        }
+    }
+
+    QJsonDocument newDoc(newObject);
+    m_wallpaperSlideShow = newDoc.toJson(QJsonDocument::Compact);
+
+    m_settingDconfig->setValue(GSKEYWALLPAPERSLIDESHOW, m_wallpaperSlideShow);
+
     onWallpaperChanged();
 }
 
@@ -253,38 +291,44 @@ bool SlideshowManager::changeBgAfterLogin(QString monitorSpace)
 {
     QString runDir = utils::GetUserRuntimeDir();
 
-    QFile file("/proc/self/sessionid");
-    if (!file.open(QIODevice::ReadOnly)) {
-        qWarning() << "open /proc/self/sessionid fail";
-        return false;
-    }
+    QDBusPendingReply<QString> currentSessionPath = DDBusSender()
+        .service("org.deepin.dde.SessionManager1")
+        .path("/org/deepin/dde/Session1")
+        .interface("org.deepin.dde.Session1")
+        .method("GetSessionPath")
+        .call();
 
-    QString currentSessionId = file.readAll();
-    currentSessionId = currentSessionId.simplified();
-
-    bool needChangeBg = false;
     runDir = runDir + "/dde-daemon-wallpaper-slideshow-login" + "/" + monitorSpace;
-    QFile fileTemp(runDir);
+    QFileInfo fileInfo(runDir);
+    QDir().mkpath(fileInfo.absolutePath());
 
-    if (!file.exists()) {
-        needChangeBg = true;
-    } else if (!fileTemp.open(QIODevice::ReadOnly)) {
-        qWarning() << "open " << runDir << " fail";
-        return false;
+    if (!fileInfo.exists()) {
+        // 文件不存在，创建并写入当前会话路径
+        QFile fileTemp(runDir);
+        if (fileTemp.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            fileTemp.write(currentSessionPath.value().toLatin1());
+            fileTemp.close();
+            autoChangeBg(monitorSpace, QDateTime::currentDateTimeUtc());
+        } else {
+            qWarning() << "failed to create file: " << runDir;
+            return false;
+        }
     } else {
-        if (currentSessionId != fileTemp.readAll().simplified()) {
-            needChangeBg = true;
+        // 文件存在，读取并比较
+        QFile fileTemp(runDir);
+        if (fileTemp.open(QIODevice::ReadWrite | QIODevice::Text)) {
+            const QString &recordSessionPath = fileTemp.readAll().simplified();
+            if (recordSessionPath != currentSessionPath) {
+                autoChangeBg(monitorSpace, QDateTime::currentDateTimeUtc());
+                fileTemp.resize(0);
+                fileTemp.write(currentSessionPath.value().toLatin1());
+            }
+            fileTemp.close();
+        } else {
+            qWarning() << "failed to open file: " << runDir;
+            return false;
         }
     }
-
-    if (needChangeBg) {
-        autoChangeBg(monitorSpace, QDateTime::currentDateTimeUtc());
-        fileTemp.write(currentSessionId.toLatin1());
-    }
-
-    file.close();
-    fileTemp.close();
-
     return true;
 }
 
@@ -322,11 +366,38 @@ void SlideshowManager::handlePrepareForSleep(bool sleep)
 
 void SlideshowManager::onWallpaperChanged()
 {
-    const auto wallpaper = m_dbusProxy->getCurrentWorkspaceBackground();
-    auto wallpaperType = Backgrounds::getBackgroundType(wallpaper);
-    if (wallpaperType != m_wallpaperType) {
-        qInfo() << "wallpaperSlideshow type changed: old is " << m_wallpaperType << "new: " << wallpaperType;
-        m_wallpaperType = wallpaperType;
-        updateWSPolicy(m_wallpaperSlideShow);
+    qDebug() << "wallpaper changed";
+    Backgrounds::instance()->refreshBackground();
+    bool update = false;
+    for (const auto &screen : qApp->screens()) {
+        if (screen) {
+            const QString &screenName = screen->name();
+            const auto &wallpaper = m_dbusProxy->getCurrentWorkspaceBackgroundForMonitor(screenName);
+            const auto &wallpaperType = Backgrounds::getBackgroundType(wallpaper);
+
+            if (m_wallpaperType.value(screenName) != wallpaperType) {
+                qInfo() << "wallpaperSlideshow type changed: old is " << m_wallpaperType[screenName] << "new: " << wallpaperType << "screen: " << screenName;
+                m_wallpaperType[screenName] = wallpaperType;
+                update = true;
+            }
+        }
     }
+
+    if (update) {
+        updateWSPolicy(m_wallpaperSlideShow);
+
+        for (auto it = m_wsLoopMap.begin(); it != m_wsLoopMap.end(); ++it) {
+            it.value()->updateLoopList();
+        }
+    }
+}
+
+bool SlideshowManager::isValidScreen(const QString &screenName)
+{
+    for (auto screen : qApp->screens()) {
+        if (screen && screen->name() == screenName) {
+            return true;
+        }
+    }
+    return false;
 }
