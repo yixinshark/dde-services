@@ -67,6 +67,9 @@ public slots:
     Q_SCRIPTABLE QList<ShortcutInfo> SearchShortcuts(const QString &keyword);
     Q_SCRIPTABLE bool ModifyHotkeys(const QString &id, const QStringList &newHotkeys);
     Q_SCRIPTABLE bool Disable(const QString &id);
+
+    // Atomically swap the hotkeys of two shortcuts in a single compositor commit.
+    Q_SCRIPTABLE bool SwapHotkeys(const QString &id1, const QString &id2);
     Q_SCRIPTABLE void ReloadConfigs();
     Q_SCRIPTABLE void Reset();
     

@@ -232,6 +232,85 @@ bool KeybindingManager::ModifyHotkeys(const QString &id, const QStringList &newH
     return true;
 }
 
+bool KeybindingManager::SwapHotkeys(const QString &id1, const QString &id2)
+{
+    if (!m_keyConfigsMap.contains(id1) || !m_keyConfigsMap.contains(id2))
+        return false;
+
+    KeyConfig config1 = m_keyConfigsMap[id1];
+    KeyConfig config2 = m_keyConfigsMap[id2];
+
+    if (!config1.enabled || !config1.modifiable || !config2.enabled || !config2.modifiable) {
+        qWarning() << "SwapHotkeys: both shortcuts must be enabled and modifiable:"
+                    << id1 << id2;
+        return false;
+    }
+
+    const QStringList hotkeys1 = config1.hotkeys;
+    const QStringList hotkeys2 = config2.hotkeys;
+
+    // Phase 1: unbind both, then rebind with swapped hotkeys.
+    m_keyHandler->unregisterKey(id1);
+    m_keyHandler->unregisterKey(id2);
+
+    config1.hotkeys = hotkeys2;
+    config2.hotkeys = hotkeys1;
+
+    bool reg1 = m_keyHandler->registerKey(config1);
+    bool reg2 = m_keyHandler->registerKey(config2);
+
+    if (!reg1 || !reg2) {
+        qWarning() << "SwapHotkeys: registerKey failed" << id1 << reg1 << id2 << reg2;
+        // Roll back: restore original hotkeys and commit.
+        config1.hotkeys = hotkeys1;
+        config2.hotkeys = hotkeys2;
+        m_keyHandler->registerKey(config1);
+        m_keyHandler->registerKey(config2);
+        if (m_keyHandler->commitSync()) {
+            m_keyConfigsMap[id1] = config1;
+            m_keyConfigsMap[id2] = config2;
+            emit ShortcutChanged(id1, toShortcutInfo(config1));
+            emit ShortcutChanged(id2, toShortcutInfo(config2));
+        }
+        return false;
+    }
+
+    // Phase 2: commit to compositor.  Do NOT update m_keyConfigsMap yet
+    // — if commit fails we want the map to still hold the originals.
+    if (!m_keyHandler->commitSync()) {
+        qWarning() << "SwapHotkeys: commit failed, rolling back";
+        m_keyHandler->unregisterKey(id1);
+        m_keyHandler->unregisterKey(id2);
+        config1.hotkeys = hotkeys1;
+        config2.hotkeys = hotkeys2;
+        if (m_keyHandler->registerKey(config1))
+            m_keyConfigsMap[id1] = config1;
+        else
+            m_keyConfigsMap.remove(id1);
+        if (m_keyHandler->registerKey(config2))
+            m_keyConfigsMap[id2] = config2;
+        else
+            m_keyConfigsMap.remove(id2);
+        if (m_keyHandler->commitSync()) {
+            // Rollback succeeded — notify the control center so both
+            // UI rows reflect the restored state.
+            emit ShortcutChanged(id1, toShortcutInfo(m_keyConfigsMap[id1]));
+            emit ShortcutChanged(id2, toShortcutInfo(m_keyConfigsMap[id2]));
+        }
+        return false;
+    }
+
+    // Phase 3: commit succeeded — update map, persist, notify.
+    m_keyConfigsMap[id1] = config1;
+    m_keyConfigsMap[id2] = config2;
+    m_loader->updateValue(id1, "hotkeys", config1.hotkeys);
+    m_loader->updateValue(id2, "hotkeys", config2.hotkeys);
+    emit ShortcutChanged(id1, toShortcutInfo(config1));
+    emit ShortcutChanged(id2, toShortcutInfo(config2));
+
+    return true;
+}
+
 bool KeybindingManager::Disable(const QString &id)
 {
     if (!m_keyConfigsMap.contains(id)) {
